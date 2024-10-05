@@ -477,6 +477,15 @@ struct btree_trans_paths {
 	struct btree_path	paths[];
 };
 
+struct btree_trans_waiter {
+	struct six_lock_waiter		waiter;
+	struct rcu_head			rcu;
+	struct btree_trans		*trans;
+	struct btree_bkey_cached_common *locking;
+	u8				lock_must_abort;
+	u8				lock_may_not_fail;
+};
+
 struct btree_trans {
 	struct bch_fs		*c;
 
@@ -494,8 +503,6 @@ struct btree_trans {
 	btree_path_idx_t	nr_paths_max;
 	btree_path_idx_t	nr_updates;
 	u8			fn_idx;
-	u8			lock_must_abort;
-	bool			lock_may_not_fail:1;
 	bool			srcu_held:1;
 	bool			locked:1;
 	bool			pf_memalloc_nofs:1;
@@ -517,8 +524,8 @@ struct btree_trans {
 	unsigned long		srcu_lock_time;
 
 	const char		*fn;
-	struct btree_bkey_cached_common *locking;
-	struct six_lock_waiter	locking_wait;
+	struct task_struct	*task;
+	struct btree_trans_waiter *locking_wait;
 	int			srcu_idx;
 
 	/* update path: */

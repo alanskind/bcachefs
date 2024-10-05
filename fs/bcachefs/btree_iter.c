@@ -3154,10 +3154,10 @@ struct btree_trans *__bch2_trans_get(struct bch_fs *c, unsigned fn_idx)
 		struct btree_trans *pos;
 		pid_t pid = current->pid;
 
-		trans->locking_wait.task = current;
+		trans->task = current;
 
 		list_for_each_entry(pos, &c->btree_trans_list, list) {
-			struct task_struct *pos_task = READ_ONCE(pos->locking_wait.task);
+			struct task_struct *pos_task = READ_ONCE(pos->task);
 			/*
 			 * We'd much prefer to be stricter here and completely
 			 * disallow multiple btree_trans in the same thread -
@@ -3176,7 +3176,7 @@ got_trans:
 	trans->c		= c;
 	trans->last_begin_time	= local_clock();
 	trans->fn_idx		= fn_idx;
-	trans->locking_wait.task = current;
+	trans->task = current;
 	trans->journal_replay_not_finished =
 		unlikely(!test_bit(JOURNAL_replay_done, &c->journal.flags)) &&
 		atomic_inc_not_zero(&c->journal_keys.ref);
@@ -3267,8 +3267,10 @@ void bch2_trans_put(struct btree_trans *trans)
 	 * trans->ref protects trans->locking_wait.task, btree_paths array; used
 	 * by cycle detector
 	 */
+	unsigned long cookie = start_poll_synchronize_rcu_expedited();
 	closure_return_sync(&trans->ref);
-	trans->locking_wait.task = NULL;
+	cond_synchronize_rcu_expedited(cookie);
+	trans->task = NULL;
 
 	unsigned long *paths_allocated = trans->paths_allocated;
 	trans->paths_allocated	= NULL;
@@ -3301,7 +3303,7 @@ bool bch2_current_has_btree_trans(struct bch_fs *c)
 	struct btree_trans *trans;
 	bool ret = false;
 	list_for_each_entry(trans, &c->btree_trans_list, list)
-		if (trans->locking_wait.task == current &&
+		if (trans->task == current &&
 		    trans->locked) {
 			ret = true;
 			break;
@@ -3333,9 +3335,10 @@ bch2_btree_bkey_cached_common_to_text(struct printbuf *out,
 
 void bch2_btree_trans_to_text(struct printbuf *out, struct btree_trans *trans)
 {
+	struct btree_trans_waiter *waiter;
 	struct btree_bkey_cached_common *b;
 	static char lock_types[] = { 'r', 'i', 'w' };
-	struct task_struct *task = READ_ONCE(trans->locking_wait.task);
+	struct task_struct *task = READ_ONCE(trans->task);
 	unsigned l, idx;
 
 	/* before rcu_read_lock(): */
@@ -3382,12 +3385,12 @@ void bch2_btree_trans_to_text(struct printbuf *out, struct btree_trans *trans)
 		}
 	}
 
-	b = READ_ONCE(trans->locking);
-	if (b) {
+	waiter = rcu_dereference(trans->locking_wait);
+	if (waiter) {
 		prt_printf(out, "  blocked for %lluus on\n",
-			   div_u64(local_clock() - trans->locking_wait.start_time, 1000));
-		prt_printf(out, "    %c", lock_types[trans->locking_wait.lock_want]);
-		bch2_btree_bkey_cached_common_to_text(out, b);
+			   div_u64(local_clock() - waiter->waiter.start_time, 1000));
+		prt_printf(out, "    %c", lock_types[waiter->waiter.lock_want]);
+		bch2_btree_bkey_cached_common_to_text(out, waiter->locking);
 		prt_newline(out);
 	}
 out:

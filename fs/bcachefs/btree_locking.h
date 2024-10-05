@@ -218,14 +218,17 @@ static inline int __btree_node_lock_nopath(struct btree_trans *trans,
 					 bool lock_may_not_fail,
 					 unsigned long ip)
 {
-	trans->lock_may_not_fail = lock_may_not_fail;
-	trans->lock_must_abort	= false;
-	trans->locking		= b;
+	struct btree_trans_waiter *waiter = kzalloc(sizeof(*waiter), GFP_KERNEL);
+	waiter->lock_may_not_fail = lock_may_not_fail;
+	waiter->lock_must_abort	= false;
+	waiter->locking = b;
+	waiter->trans = trans;
+	rcu_assign_pointer(trans->locking_wait, waiter);
 
-	int ret = six_lock_ip_waiter(&b->lock, type, &trans->locking_wait,
+	int ret = six_lock_ip_waiter(&b->lock, type, (struct six_lock_waiter *)waiter,
 				     bch2_six_check_for_deadlock, trans, ip);
-	WRITE_ONCE(trans->locking, NULL);
-	WRITE_ONCE(trans->locking_wait.start_time, 0);
+	rcu_assign_pointer(trans->locking_wait, NULL);
+	kfree_rcu(waiter, rcu);
 
 	if (!ret)
 		trace_btree_path_lock(trans, _THIS_IP_, b);

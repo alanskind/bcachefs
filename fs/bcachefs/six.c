@@ -446,7 +446,7 @@ static int six_lock_slowpath(struct six_lock *lock, enum six_lock_type type,
 				wait->start_time = last->start_time + 1;
 		}
 
-		list_add_tail(&wait->list, &lock->wait_list);
+		list_add_tail_rcu(&wait->list, &lock->wait_list);
 	}
 	raw_spin_unlock(&lock->wait_lock);
 
@@ -488,7 +488,7 @@ static int six_lock_slowpath(struct six_lock *lock, enum six_lock_type type,
 			raw_spin_lock(&lock->wait_lock);
 			acquired = wait->lock_acquired;
 			if (!acquired)
-				list_del(&wait->list);
+				list_del_rcu(&wait->list);
 			raw_spin_unlock(&lock->wait_lock);
 
 			if (unlikely(acquired)) {
