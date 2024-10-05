@@ -526,6 +526,7 @@ struct btree_trans {
 	const char		*fn;
 	struct task_struct	*task;
 	struct btree_trans_waiter *locking_wait;
+	unsigned long		*cookie;
 	int			srcu_idx;
 
 	/* update path: */

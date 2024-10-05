@@ -3267,9 +3267,11 @@ void bch2_trans_put(struct btree_trans *trans)
 	 * trans->ref protects trans->locking_wait.task, btree_paths array; used
 	 * by cycle detector
 	 */
-	unsigned long cookie = start_poll_synchronize_rcu_expedited();
 	closure_return_sync(&trans->ref);
-	cond_synchronize_rcu_expedited(cookie);
+	if (trans->cookie) {
+		cond_synchronize_rcu_expedited(*trans->cookie);
+		kfree(trans->cookie);
+	}
 	trans->task = NULL;
 
 	unsigned long *paths_allocated = trans->paths_allocated;

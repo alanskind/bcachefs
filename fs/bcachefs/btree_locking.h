@@ -228,6 +228,9 @@ static inline int __btree_node_lock_nopath(struct btree_trans *trans,
 	int ret = six_lock_ip_waiter(&b->lock, type, (struct six_lock_waiter *)waiter,
 				     bch2_six_check_for_deadlock, trans, ip);
 	rcu_assign_pointer(trans->locking_wait, NULL);
+	if (!trans->cookie)
+		trans->cookie = kzalloc(sizeof(unsigned long), GFP_KERNEL);
+	*trans->cookie = start_poll_synchronize_rcu_expedited();
 	kfree_rcu(waiter, rcu);
 
 	if (!ret)
