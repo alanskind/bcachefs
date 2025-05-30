@@ -206,8 +206,7 @@ static inline bool may_alloc_bucket(struct bch_fs *c,
 
 static struct open_bucket *__try_alloc_bucket(struct bch_fs *c,
 					      struct alloc_request *req,
-					      u64 bucket, u8 gen,
-					      struct closure *cl)
+					      u64 bucket, u8 gen)
 {
 	struct bch_dev *ca = req->ca;
 
@@ -222,12 +221,18 @@ static struct open_bucket *__try_alloc_bucket(struct bch_fs *c,
 	spin_lock(&c->freelist_lock);
 
 	if (unlikely(c->open_buckets_nr_free <= bch2_open_buckets_reserved(req->watermark))) {
-		if (cl)
-			closure_wait(&c->open_buckets_wait, cl);
-
 		track_event_change(&c->times[BCH_TIME_blocked_allocate_open_bucket], true);
+
+		int ret;
+		if (req->cl && !(req->flags & BCH_WRITE_alloc_nowait)) {
+			closure_wait(&c->open_buckets_wait, req->cl);
+			ret = bch_err_throw(c, open_bucket_alloc_blocked);
+		} else {
+			ret = bch_err_throw(c, open_buckets_empty);
+		}
+
 		spin_unlock(&c->freelist_lock);
-		return ERR_PTR(bch_err_throw(c, open_buckets_empty));
+		return ERR_PTR(ret);
 	}
 
 	/* Recheck under lock: */
@@ -259,8 +264,7 @@ static struct open_bucket *__try_alloc_bucket(struct bch_fs *c,
 
 static struct open_bucket *try_alloc_bucket(struct btree_trans *trans,
 					    struct alloc_request *req,
-					    struct btree_iter *freespace_iter,
-					    struct closure *cl)
+					    struct btree_iter *freespace_iter)
 {
 	struct bch_fs *c = trans->c;
 	u64 b = freespace_iter->pos.offset & ~(~0ULL << 56);
@@ -275,7 +279,7 @@ static struct open_bucket *try_alloc_bucket(struct btree_trans *trans,
 	if (ret)
 		return NULL;
 
-	return __try_alloc_bucket(c, req, b, gen, cl);
+	return __try_alloc_bucket(c, req, b, gen);
 }
 
 /*
@@ -283,8 +287,7 @@ static struct open_bucket *try_alloc_bucket(struct btree_trans *trans,
  */
 static noinline struct open_bucket *
 bch2_bucket_alloc_early(struct btree_trans *trans,
-			struct alloc_request *req,
-			struct closure *cl)
+			struct alloc_request *req)
 {
 	struct bch_fs *c = trans->c;
 	struct bch_dev *ca = req->ca;
@@ -348,7 +351,7 @@ again:
 		req->counters.buckets_seen++;
 
 		ob = may_alloc_bucket(c, req, k.k->p)
-			? __try_alloc_bucket(c, req, k.k->p.offset, a->gen, cl)
+			? __try_alloc_bucket(c, req, k.k->p.offset, a->gen)
 			: NULL;
 next:
 		bch2_set_btree_iter_dontneed(trans, &citer);
@@ -374,8 +377,7 @@ next:
 }
 
 static struct open_bucket *bch2_bucket_alloc_freelist(struct btree_trans *trans,
-						      struct alloc_request *req,
-						      struct closure *cl)
+						      struct alloc_request *req)
 {
 	struct bch_dev *ca = req->ca;
 	struct btree_iter iter;
@@ -417,7 +419,7 @@ again:
 				goto next;
 			}
 
-			ob = try_alloc_bucket(trans, req, &iter, cl);
+			ob = try_alloc_bucket(trans, req, &iter);
 			if (ob) {
 				if (!IS_ERR(ob))
 					*dev_alloc_cursor = iter.pos.offset;
@@ -450,7 +452,6 @@ fail:
 
 static noinline void trace_bucket_alloc2(struct bch_fs *c,
 					 struct alloc_request *req,
-					 struct closure *cl,
 					 struct open_bucket *ob)
 {
 	struct printbuf buf = PRINTBUF;
@@ -460,7 +461,8 @@ static noinline void trace_bucket_alloc2(struct bch_fs *c,
 	prt_printf(&buf, "dev\t%s (%u)\n",	req->ca->name, req->ca->dev_idx);
 	prt_printf(&buf, "watermark\t%s\n",	bch2_watermarks[req->watermark]);
 	prt_printf(&buf, "data type\t%s\n",	__bch2_data_types[req->data_type]);
-	prt_printf(&buf, "blocking\t%u\n",	cl != NULL);
+	prt_printf(&buf, "blocking\t%u\n",	!req->will_retry_target_devices &&
+		   !req->will_retry_all_devices);
 	prt_printf(&buf, "free\t%llu\n",	req->usage.buckets[BCH_DATA_free]);
 	prt_printf(&buf, "avail\t%llu\n",	dev_buckets_free(req->ca, req->usage, req->watermark));
 	prt_printf(&buf, "copygc_wait\t%llu/%lli\n",
@@ -488,28 +490,23 @@ static noinline void trace_bucket_alloc2(struct bch_fs *c,
  * bch2_bucket_alloc_trans - allocate a single bucket from a specific device
  * @trans:	transaction object
  * @req:	state for the entire allocation
- * @cl:		if not NULL, closure to be used to wait if buckets not available
- * @nowait:	if true, do not wait for buckets to become available
  *
  * Returns:	an open_bucket on success, or an ERR_PTR() on failure.
  */
 static struct open_bucket *bch2_bucket_alloc_trans(struct btree_trans *trans,
-						   struct alloc_request *req,
-						   struct closure *cl,
-						   bool nowait)
+						   struct alloc_request *req)
 {
 	struct bch_fs *c = trans->c;
 	struct bch_dev *ca = req->ca;
 	struct open_bucket *ob = NULL;
 	bool freespace = READ_ONCE(ca->mi.freespace_initialized);
-	u64 avail;
-	bool waiting = nowait;
+	bool waiting = false;
 
 	req->btree_bitmap = req->data_type == BCH_DATA_btree;
 	memset(&req->counters, 0, sizeof(req->counters));
 again:
 	bch2_dev_usage_read_fast(ca, &req->usage);
-	avail = dev_buckets_free(ca, req->usage, req->watermark);
+	u64 avail = dev_buckets_free(ca, req->usage, req->watermark);
 
 	if (req->usage.buckets[BCH_DATA_need_discard] > avail)
 		bch2_dev_do_discards(ca);
@@ -525,8 +522,11 @@ again:
 		    c->recovery.pass_done < BCH_RECOVERY_PASS_check_allocations)
 			goto alloc;
 
-		if (cl && !waiting) {
-			closure_wait(&c->freelist_wait, cl);
+		if (req->cl &&
+		    !req->will_retry_target_devices &&
+		    !req->will_retry_all_devices &&
+		    !(req->flags & BCH_WRITE_alloc_nowait)) {
+			closure_wait(&c->freelist_wait, req->cl);
 			waiting = true;
 			goto again;
 		}
@@ -541,8 +541,8 @@ again:
 		closure_wake_up(&c->freelist_wait);
 alloc:
 	ob = likely(freespace)
-		? bch2_bucket_alloc_freelist(trans, req, cl)
-		: bch2_bucket_alloc_early(trans, req, cl);
+		? bch2_bucket_alloc_freelist(trans, req)
+		: bch2_bucket_alloc_early(trans, req);
 
 	if (req->counters.need_journal_commit * 2 > avail)
 		bch2_journal_flush_async(&c->journal, NULL);
@@ -571,7 +571,7 @@ err:
 	if (!IS_ERR(ob)
 	    ? trace_bucket_alloc_enabled()
 	    : trace_bucket_alloc_fail_enabled())
-		trace_bucket_alloc2(c, req, cl, ob);
+		trace_bucket_alloc2(c, req, ob);
 
 	return ob;
 }
@@ -583,13 +583,14 @@ struct open_bucket *bch2_bucket_alloc(struct bch_fs *c, struct bch_dev *ca,
 {
 	struct open_bucket *ob;
 	struct alloc_request req = {
+		.cl		= cl,
 		.watermark	= watermark,
 		.data_type	= data_type,
 		.ca		= ca,
 	};
 
 	bch2_trans_do(c,
-		PTR_ERR_OR_ZERO(ob = bch2_bucket_alloc_trans(trans, &req, cl, false)));
+		PTR_ERR_OR_ZERO(ob = bch2_bucket_alloc_trans(trans, &req)));
 	return ob;
 }
 
@@ -703,10 +704,9 @@ static int add_new_bucket(struct bch_fs *c,
 	return 0;
 }
 
-inline int bch2_bucket_alloc_set_trans(struct btree_trans *trans,
-				       struct alloc_request *req,
-				       struct dev_stripe_state *stripe,
-				       struct closure *_cl)
+int bch2_bucket_alloc_set_trans(struct btree_trans *trans,
+				struct alloc_request *req,
+				struct dev_stripe_state *stripe)
 {
 	struct bch_fs *c = trans->c;
 	struct closure *cl = NULL;
@@ -721,6 +721,9 @@ inline int bch2_bucket_alloc_set_trans(struct btree_trans *trans,
 retry_blocking:
 	bch2_dev_alloc_list(c, stripe, &req->devs_may_alloc, &req->devs_sorted);
 
+	if (req->devs_sorted.nr == 1)
+		req->will_retry_target_devices = false;
+
 	darray_for_each(req->devs_sorted, i) {
 		req->ca = bch2_dev_tryget_noerror(c, *i);
 		if (!req->ca)
@@ -731,8 +734,7 @@ retry_blocking:
 			continue;
 		}
 
-		struct open_bucket *ob = bch2_bucket_alloc_trans(trans, req, cl,
-							req->flags & BCH_WRITE_alloc_nowait);
+		struct open_bucket *ob = bch2_bucket_alloc_trans(trans, req);
 		if (!IS_ERR(ob))
 			bch2_dev_stripe_increment_inlined(req->ca, stripe, &req->usage);
 		bch2_dev_put(req->ca);
@@ -754,8 +756,8 @@ retry_blocking:
 
 	if (ret &&
 	    !bch2_err_matches(ret, BCH_ERR_transaction_restart) &&
-	    cl != _cl) {
-		cl = _cl;
+	    req->will_retry_target_devices) {
+		req->will_retry_target_devices = false;
 		goto retry_blocking;
 	}
 
@@ -773,14 +775,13 @@ retry_blocking:
  */
 
 static int bucket_alloc_from_stripe(struct btree_trans *trans,
-				    struct alloc_request *req,
-				    struct closure *cl)
+				    struct alloc_request *req)
 {
 	struct bch_fs *c = trans->c;
 	int ret = 0;
 
 	struct ec_stripe_head *h =
-		bch2_ec_stripe_head_get(trans, req, 0, cl);
+		bch2_ec_stripe_head_get(trans, req, 0);
 	if (IS_ERR(h))
 		return PTR_ERR(h);
 	if (!h)
@@ -1174,7 +1175,7 @@ int bch2_alloc_sectors_start_trans(struct btree_trans *trans,
 			     unsigned nr_replicas_required,
 			     enum bch_watermark watermark,
 			     enum bch_write_flags flags,
-			     struct closure *_cl,
+			     struct closure *cl,
 			     struct write_point **wp_ret)
 {
 	struct bch_fs *c = trans->c;
@@ -1193,6 +1194,7 @@ int bch2_alloc_sectors_start_trans(struct btree_trans *trans,
 	if (nr_replicas < 2)
 		erasure_code = false;
 
+	req->cl			= cl;
 	req->nr_replicas	= nr_replicas;
 	req->target		= target;
 	req->watermark		= watermark;
@@ -1201,11 +1203,13 @@ int bch2_alloc_sectors_start_trans(struct btree_trans *trans,
 
 	BUG_ON(!nr_replicas || !nr_replicas_required);
 retry:
-	req->ec			= erasure_code;
-	req->ptrs.nr		= 0;
-	req->nr_effective	= 0;
-	req->have_cache		= false;
-	write_points_nr		= c->write_points_nr;
+	req->ec				= erasure_code;
+	req->will_retry_target_devices	= true;
+	req->will_retry_all_devices	= true;
+	req->ptrs.nr			= 0;
+	req->nr_effective		= 0;
+	req->have_cache			= false;
+	write_points_nr			= c->write_points_nr;
 
 	*wp_ret = req->wp = writepoint_find(trans, write_point.v);
 
@@ -1214,11 +1218,6 @@ retry:
 	/* metadata may not allocate on cache devices: */
 	if (req->data_type != BCH_DATA_user)
 		req->have_cache = true;
-
-	/* If we're going to fall back to the whole fs, try nonblocking first */
-	struct closure *cl = req->target && !(flags & BCH_WRITE_only_specified_devs)
-		? _cl
-		: NULL;
 
 	ret = bch2_trans_relock(trans);
 	if (ret)
@@ -1237,50 +1236,48 @@ retry:
 		ret =   bucket_alloc_set_writepoint(c, req) ?:
 			bucket_alloc_set_partial(c, req) ?:
 			(req->ec
-			 ? bucket_alloc_from_stripe(trans, req, _cl)
-			 : bch2_bucket_alloc_set_trans(trans, req, &req->wp->stripe, cl));
+			 ? bucket_alloc_from_stripe(trans, req)
+			 : bch2_bucket_alloc_set_trans(trans, req, &req->wp->stripe));
 
-		if (bch2_err_matches(ret, BCH_ERR_transaction_restart))
+		if (bch2_err_matches(ret, BCH_ERR_transaction_restart) ||
+		    bch2_err_matches(ret, BCH_ERR_operation_blocked))
 			goto err;
 
-		/* Don't retry from all devices if we're out of open buckets: */
-		if (ret == -BCH_ERR_open_buckets_empty)
-			goto retry_blocking;
+		if (ret == -BCH_ERR_freelist_empty ||
+		    ret == -BCH_ERR_insufficient_devices) {
+			if (req->will_retry_all_devices) {
+				BUG_ON(!req->will_retry_all_devices);
+				req->will_retry_all_devices	= false;
+				/*
+				 * Only try to allocate cache (durability = 0 devices) from the
+				 * specified target:
+				 */
+				if (req->target &&
+				    (!(flags & BCH_WRITE_only_specified_devs) ||
+				     (ret == -BCH_ERR_insufficient_devices))) {
+					req->have_cache		= true;
+					req->target		= 0;
+				}
+				continue;
+			}
 
-		if (ret == -BCH_ERR_freelist_empty) {
-			if (req->target && !(flags & BCH_WRITE_only_specified_devs))
-				goto retry_all;
-			goto retry_blocking;
+			if (ret == -BCH_ERR_insufficient_devices &&
+			    req->nr_effective >= nr_replicas_required)
+				ret = 0;
+			else
+				goto err;
 		}
 
-		if (ret == -BCH_ERR_insufficient_devices && req->target)
-			goto retry_all;
-
 		if (req->nr_effective < req->nr_replicas && req->ec) {
-			req->ec = false;
+			req->ec				= false;
+			req->will_retry_target_devices	= true;
+			req->will_retry_all_devices	= true;
 			continue;
 		}
 
-		if (ret == -BCH_ERR_insufficient_devices) {
-			if (req->nr_effective < nr_replicas_required)
-				goto err;
-			ret = 0;
-		}
-
+		BUG_ON(req->nr_effective < nr_replicas_required);
 		BUG_ON(ret < 0);
 		break;
-retry_blocking:
-		if (cl == _cl)
-			goto err;
-		cl = _cl;
-		continue;
-retry_all:
-		/*
-		 * Only try to allocate cache (durability = 0 devices) from the
-		 * specified target:
-		 */
-		req->have_cache	= true;
-		req->target	= 0;
 	}
 
 	if (req->nr_effective > req->nr_replicas)
