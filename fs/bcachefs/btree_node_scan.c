@@ -196,12 +196,14 @@ static void try_read_btree_node(struct find_btree_nodes *f, struct bch_dev *ca,
 
 	CLASS(printbuf, buf)();
 	if (!bch2_btree_node_read_done(c, ca, b, NULL, &buf)) {
+		/* read_done will swap out b->data for another buffer */
+		bn = b->data;
 		/*
 		 * Grab journal_seq here because we want the max journal_seq of
 		 * any bset; read_done sorts down to a single set and picks the
 		 * max journal_seq
 		 */
-		n.journal_seq		= le64_to_cpu(b->data->keys.journal_seq),
+		n.journal_seq		= le64_to_cpu(bn->keys.journal_seq),
 		n.sectors_written	= b->written;
 
 		mutex_lock(&f->lock);
